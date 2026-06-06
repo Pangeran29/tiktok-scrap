@@ -33,6 +33,7 @@ export function parseCliArgs(args: string[], env = process.env): CliOptions {
     commentsPerVideo: parsePositiveInteger(readFlag(args, 'comments') ?? env.COMMENTS_PER_VIDEO, 50, 'comments'),
     headless: hasFlag(args, 'headless') || env.HEADLESS === '1' || env.HEADLESS?.toLowerCase() === 'true',
     keepBrowserOpen: hasFlag(args, 'keep-browser-open') || env.KEEP_BROWSER_OPEN === '1',
+    downloadVideo: hasFlag(args, 'download-video'),
     output: readFlag(args, 'output') || null,
   };
 }
@@ -54,6 +55,7 @@ async function main() {
   console.log(`Max videos: ${options.maxVideos}`);
   console.log(`Comments per video: ${options.commentsPerVideo}`);
   console.log(`Headless: ${options.headless}`);
+  console.log(`Download video: ${options.downloadVideo}`);
 
   const result = await scrapeTikTok(options);
 

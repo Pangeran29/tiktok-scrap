@@ -1,3 +1,9 @@
+import fs from 'node:fs/promises';
+import { createWriteStream } from 'node:fs';
+import path from 'node:path';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
+
 import puppeteer from 'puppeteer-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import type { Browser, Page } from 'puppeteer';
@@ -31,7 +37,8 @@ async function collectVideoUrlsFromSearch(page: Page, search: string, maxVideos:
   const searchUrl = buildSearchUrl(search);
   console.log(`Opening search page: ${searchUrl}`);
 
-  await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+  const response = await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+  await assertTikTokAccess(page, response?.status() ?? null);
   await Promise.race([
     page.waitForSelector('a[href*="/video/"]', { timeout: 10_000 }).catch(() => null),
     page.waitForSelector('[data-e2e="search-video-item"]', { timeout: 10_000 }).catch(() => null),
@@ -39,9 +46,12 @@ async function collectVideoUrlsFromSearch(page: Page, search: string, maxVideos:
   await sleep(1000);
 
   const urls = new Set<string>();
-  const maxScrolls = Math.max(3, Math.ceil(maxVideos / 4) + 2);
+  const maxScrolls = Math.max(20, maxVideos * 2);
+  const maxStagnantScrolls = 6;
+  let stagnantScrolls = 0;
 
   for (let attempt = 0; attempt < maxScrolls && urls.size < maxVideos; attempt += 1) {
+    const sizeBefore = urls.size;
     const hrefs = await page.evaluate(() => {
       const anchors = Array.from(document.querySelectorAll('a[href*="/video/"]')) as HTMLAnchorElement[];
       return anchors.map((anchor) => anchor.href || anchor.getAttribute('href') || '').filter(Boolean);
@@ -54,8 +64,42 @@ async function collectVideoUrlsFromSearch(page: Page, search: string, maxVideos:
     }
 
     if (urls.size >= maxVideos) break;
-    await page.mouse.wheel({ deltaY: 1400 }).catch(() => undefined);
-    await sleep(800);
+
+    if (urls.size === sizeBefore) {
+      stagnantScrolls += 1;
+    } else {
+      stagnantScrolls = 0;
+      console.log(`Found ${urls.size}/${maxVideos} video URL(s)...`);
+    }
+
+    if (stagnantScrolls >= maxStagnantScrolls) break;
+
+    const scrolled = await page
+      .evaluate(() => {
+        const candidates = Array.from(document.querySelectorAll('*'))
+          .filter((element) => {
+            const htmlElement = element as HTMLElement;
+            const style = getComputedStyle(htmlElement);
+            return (
+              (style.overflowY === 'auto' || style.overflowY === 'scroll') &&
+              htmlElement.scrollHeight > htmlElement.clientHeight
+            );
+          })
+          .sort((a, b) => (b as HTMLElement).scrollHeight - (a as HTMLElement).scrollHeight);
+
+        const container = candidates[0] as HTMLElement | undefined;
+        if (!container) return false;
+
+        container.scrollTop = container.scrollHeight;
+        container.dispatchEvent(new Event('scroll', { bubbles: true }));
+        return true;
+      })
+      .catch(() => false);
+
+    if (!scrolled) {
+      await page.mouse.wheel({ deltaY: 2400 }).catch(() => undefined);
+    }
+    await sleep(1500);
   }
 
   if (urls.size === 0) throw new Error('Failed to find TikTok video links on the search page.');
@@ -63,6 +107,26 @@ async function collectVideoUrlsFromSearch(page: Page, search: string, maxVideos:
   const collected = Array.from(urls).slice(0, maxVideos);
   console.log(`Collected ${collected.length} video URL(s) from search results.`);
   return collected;
+}
+
+async function assertTikTokAccess(page: Page, status: number | null): Promise<void> {
+  const blocked = await page
+    .evaluate(() => {
+      const text = `${document.title} ${document.body?.innerText || ''}`.toLowerCase();
+      return (
+        text.includes('access to www.tiktok.com was denied') ||
+        text.includes("you don't have authorization to view this page") ||
+        text.includes('http error 403')
+      );
+    })
+    .catch(() => false);
+
+  if (status === 403 || blocked) {
+    throw new Error(
+      'TikTok returned HTTP 403 before scraping. Close other scraper browsers and retry later. ' +
+        'TikTok may be temporarily blocking the current session or network/IP.',
+    );
+  }
 }
 
 export async function openTikTokForDebug(search: string | null, headless: boolean): Promise<void> {
@@ -194,6 +258,7 @@ async function extractVideo(page: Page, keyword: string | null, commentsLimit: n
   }
 
   return {
+    videoId: (normalizedUrl ?? currentUrl).match(/\/video\/(\d+)/)?.[1] ?? null,
     url: normalizedUrl ?? domData.url ?? currentUrl,
     title: domData.ogTitle ?? caption ?? normalizedUrl ?? currentUrl,
     caption,
@@ -201,6 +266,8 @@ async function extractVideo(page: Page, keyword: string | null, commentsLimit: n
     username,
     authorUrl,
     videoSrc: domData.videoSrc,
+    videoDownloadUrl: null,
+    videoFile: null,
     stats,
     keywordMentioned: isKeywordMentioned(caption, comments, keyword),
     comments,
@@ -306,6 +373,102 @@ function parseMetricCount(value: string | null): number | null {
   return Math.round(amount * multiplier);
 }
 
+async function downloadVideo(
+  page: Page,
+  video: ScrapedVideo,
+): Promise<{ filePath: string | null; downloadUrl: string | null; error?: string }> {
+  try {
+    const downloadUrl = await resolveVideoDownloadUrl(page, video.videoSrc);
+    if (!downloadUrl) {
+      throw new Error('Could not resolve the underlying TikTok CDN video URL.');
+    }
+
+    const videoId = video.url.match(/\/video\/(\d+)/)?.[1] || String(Date.now());
+    const username = sanitizeFilename(video.username || 'tiktok');
+    const relativePath = path.join('downloads', `${username}-${videoId}.mp4`);
+    const absolutePath = path.resolve(relativePath);
+
+    await fs.mkdir(path.dirname(absolutePath), { recursive: true });
+
+    const cookies = await page.cookies();
+    const userAgent = await page.evaluate(() => navigator.userAgent).catch(() => 'Mozilla/5.0');
+    const response = await fetch(downloadUrl, {
+      headers: {
+        Cookie: cookies.map((cookie) => `${cookie.name}=${cookie.value}`).join('; '),
+        Referer: video.url,
+        'User-Agent': userAgent,
+        Accept: 'video/mp4,video/*,*/*',
+      },
+    });
+
+    if (!response.ok || !response.body) {
+      throw new Error(`Download request failed with HTTP ${response.status}`);
+    }
+
+    const contentType = response.headers.get('content-type')?.toLowerCase() || '';
+    if (contentType.startsWith('image/') || contentType.includes('text/html')) {
+      throw new Error(`Resolved URL was not a video (${contentType || 'unknown content type'}).`);
+    }
+
+    await pipeline(Readable.fromWeb(response.body as never), createWriteStream(absolutePath));
+    console.log(`Downloaded video: ${relativePath}`);
+
+    return { filePath: relativePath, downloadUrl };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`Video download failed for ${video.url}: ${message}`);
+    return { filePath: null, downloadUrl: null, error: message };
+  }
+}
+
+async function resolveVideoDownloadUrl(page: Page, videoSrc: string | null): Promise<string | null> {
+  if (videoSrc?.startsWith('http')) return videoSrc;
+
+  await sleep(1000);
+
+  return page.evaluate(() => {
+    const html = document.documentElement.innerHTML;
+    for (const key of ['playAddr', 'downloadAddr']) {
+      const match = html.match(new RegExp(`"${key}":"([^"]+)"`));
+      if (!match?.[1]) continue;
+
+      const decoded = match[1]
+        .replace(/\\u002F/g, '/')
+        .replace(/\\u0026/g, '&')
+        .replace(/\\\//g, '/');
+      if (decoded.startsWith('http')) return decoded;
+    }
+
+    const resourceUrls = performance
+      .getEntriesByType('resource')
+      .map((entry) => entry.name)
+      .filter((url) => {
+        if (!url.startsWith('http')) return false;
+        const lower = url.toLowerCase();
+        return (
+          lower.includes('mime_type=video') ||
+          lower.includes('/video/tos/') ||
+          lower.includes('/obj/tos-') ||
+          lower.includes('.mp4')
+        );
+      });
+
+    if (resourceUrls.length > 0) return resourceUrls[resourceUrls.length - 1];
+
+    return null;
+  });
+}
+
+function sanitizeFilename(value: string): string {
+  const sanitized = value
+    .trim()
+    .replace(/^@/, '')
+    .replace(/[^a-z0-9._-]+/gi, '-')
+    .replace(/^-+|-+$/g, '');
+
+  return sanitized || 'tiktok';
+}
+
 async function detectCaptcha(page: Page): Promise<boolean> {
   const challenge = await page
     .$('iframe[src*="challenge"], iframe[title*="captcha"], div:has(> iframe[title*="captcha"])')
@@ -328,6 +491,7 @@ export async function scrapeTikTok(options: ScrapeOptions): Promise<ScrapeResult
       maxVideos: options.maxVideos,
       commentsPerVideo: options.commentsPerVideo,
       headless: options.headless,
+      downloadVideo: options.downloadVideo,
     },
     metrics: {
       videosTargeted: options.maxVideos,
@@ -384,6 +548,14 @@ export async function scrapeTikTok(options: ScrapeOptions): Promise<ScrapeResult
 
       console.log(`Scraping video ${index + 1}/${options.maxVideos}: ${page.url()}`);
       const video = await extractVideo(page, options.keyword, options.commentsPerVideo);
+
+      if (options.downloadVideo) {
+        const download = await downloadVideo(page, video);
+        video.videoFile = download.filePath;
+        video.videoDownloadUrl = download.downloadUrl;
+        if (download.error) video.downloadError = download.error;
+      }
+
       result.items.push(video);
       result.metrics.videosScraped = result.items.length;
       result.metrics.totalComments += video.comments.length;

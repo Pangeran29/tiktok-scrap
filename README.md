@@ -46,6 +46,9 @@ Chrome stays open until you stop the terminal with `Ctrl+C`.
 - `--keep-browser-open`: leave Chrome open after the run.
 - `--output <path>`: custom JSON output path.
 - `--open-only`: open TikTok or a TikTok video search page and do not scrape.
+- `--download-video`: save each scraped video to `downloads/` when TikTok exposes a playable video URL.
+
+Downloaded items include `videoDownloadUrl` (the resolved TikTok CDN URL) and `videoFile` (the local saved path). TikTok CDN URLs are signed and may expire.
 
 Results are written to `output/tiktok-scrape-YYYYMMDD-HHmmss.json` unless `--output` is provided.
 
