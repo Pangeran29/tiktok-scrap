@@ -4,6 +4,7 @@ import path from 'node:path';
 import type { CliOptions } from './types';
 import { openTikTokForDebug, scrapeTikTok } from './scraper';
 import { defaultOutputPath, parsePositiveInteger } from './utils';
+import { DEFAULT_REGISTRY_PATH } from './video-registry';
 
 function readFlag(args: string[], name: string): string | undefined {
   const eqPrefix = `--${name}=`;
@@ -25,15 +26,21 @@ function hasFlag(args: string[], name: string): boolean {
 export function parseCliArgs(args: string[], env = process.env): CliOptions {
   const search = readFlag(args, 'search')?.trim();
   if (!search) throw new Error('--search is required');
+  const max = readFlag(args, 'max');
+  if (max === undefined) throw new Error('--max is required');
+  const comments = readFlag(args, 'comments');
+  if (comments === undefined) throw new Error('--comments is required');
 
   return {
     search,
     keyword: readFlag(args, 'keyword')?.trim() || null,
-    maxVideos: parsePositiveInteger(readFlag(args, 'max') ?? env.MAX_VIDEOS, 10, 'max'),
-    commentsPerVideo: parsePositiveInteger(readFlag(args, 'comments') ?? env.COMMENTS_PER_VIDEO, 50, 'comments'),
+    maxVideos: parsePositiveInteger(max, 0, 'max'),
+    commentsPerVideo: parsePositiveInteger(comments, 0, 'comments'),
     headless: hasFlag(args, 'headless') || env.HEADLESS === '1' || env.HEADLESS?.toLowerCase() === 'true',
     keepBrowserOpen: hasFlag(args, 'keep-browser-open') || env.KEEP_BROWSER_OPEN === '1',
     downloadVideo: hasFlag(args, 'download-video'),
+    skipExisting: hasFlag(args, 'skip-existing'),
+    registryPath: readFlag(args, 'registry') || env.VIDEO_REGISTRY_PATH || DEFAULT_REGISTRY_PATH,
     output: readFlag(args, 'output') || null,
   };
 }
@@ -56,6 +63,8 @@ async function main() {
   console.log(`Comments per video: ${options.commentsPerVideo}`);
   console.log(`Headless: ${options.headless}`);
   console.log(`Download video: ${options.downloadVideo}`);
+  console.log(`Skip existing: ${options.skipExisting}`);
+  console.log(`Video registry: ${path.resolve(options.registryPath)}`);
 
   const result = await scrapeTikTok(options);
 

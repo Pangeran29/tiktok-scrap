@@ -40,11 +40,14 @@ export type ScrapeSettings = {
   commentsPerVideo: number;
   headless: boolean;
   downloadVideo: boolean;
+  skipExisting: boolean;
+  registryPath: string;
 };
 
 export type ScrapeMetrics = {
   videosTargeted: number;
   videosScraped: number;
+  videosSkippedExisting: number;
   totalComments: number;
   navFailures: number;
   captchasDetected: number;
@@ -69,6 +72,8 @@ export type ScrapeOptions = {
   headless: boolean;
   keepBrowserOpen: boolean;
   downloadVideo: boolean;
+  skipExisting: boolean;
+  registryPath: string;
 };
 
 export type CliOptions = ScrapeOptions & {

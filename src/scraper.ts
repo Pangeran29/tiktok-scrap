@@ -11,6 +11,7 @@ import type { Browser, Page } from 'puppeteer';
 import { extractComments } from './comments';
 import type { ScrapeOptions, ScrapeResult, ScrapedVideo, VideoStats } from './types';
 import { buildSearchUrl, isKeywordMentioned, normalizeVideoUrl, nowIso, sleep } from './utils';
+import { loadScrapedVideoIds, saveScrapedVideoId } from './video-registry';
 
 puppeteer.use(StealthPlugin());
 
@@ -33,7 +34,12 @@ async function fetchOEmbed(videoUrl: string): Promise<OEmbed | null> {
   }
 }
 
-async function collectVideoUrlsFromSearch(page: Page, search: string, maxVideos: number): Promise<string[]> {
+async function collectVideoUrlsFromSearch(
+  page: Page,
+  search: string,
+  maxVideos: number,
+  existingVideoIds: Set<string>,
+): Promise<{ urls: string[]; skippedExisting: number }> {
   const searchUrl = buildSearchUrl(search);
   console.log(`Opening search page: ${searchUrl}`);
 
@@ -46,12 +52,14 @@ async function collectVideoUrlsFromSearch(page: Page, search: string, maxVideos:
   await sleep(1000);
 
   const urls = new Set<string>();
-  const maxScrolls = Math.max(20, maxVideos * 2);
+  const skippedIds = new Set<string>();
+  const seenIds = new Set<string>();
+  const maxScrolls = Math.max(40, maxVideos * 5);
   const maxStagnantScrolls = 6;
   let stagnantScrolls = 0;
 
   for (let attempt = 0; attempt < maxScrolls && urls.size < maxVideos; attempt += 1) {
-    const sizeBefore = urls.size;
+    const seenBefore = seenIds.size;
     const hrefs = await page.evaluate(() => {
       const anchors = Array.from(document.querySelectorAll('a[href*="/video/"]')) as HTMLAnchorElement[];
       return anchors.map((anchor) => anchor.href || anchor.getAttribute('href') || '').filter(Boolean);
@@ -59,17 +67,25 @@ async function collectVideoUrlsFromSearch(page: Page, search: string, maxVideos:
 
     for (const href of hrefs) {
       const normalized = normalizeVideoUrl(href.startsWith('http') ? href : `https://www.tiktok.com${href}`);
-      if (normalized) urls.add(normalized);
+      const videoId = normalized?.match(/\/video\/(\d+)/)?.[1];
+      if (normalized && videoId) {
+        seenIds.add(videoId);
+        if (existingVideoIds.has(videoId)) {
+          skippedIds.add(videoId);
+        } else {
+          urls.add(normalized);
+        }
+      }
       if (urls.size >= maxVideos) break;
     }
 
     if (urls.size >= maxVideos) break;
 
-    if (urls.size === sizeBefore) {
+    if (seenIds.size === seenBefore) {
       stagnantScrolls += 1;
     } else {
       stagnantScrolls = 0;
-      console.log(`Found ${urls.size}/${maxVideos} video URL(s)...`);
+      console.log(`Found ${urls.size}/${maxVideos} new video URL(s); ${skippedIds.size} already scraped.`);
     }
 
     if (stagnantScrolls >= maxStagnantScrolls) break;
@@ -102,11 +118,14 @@ async function collectVideoUrlsFromSearch(page: Page, search: string, maxVideos:
     await sleep(1500);
   }
 
-  if (urls.size === 0) throw new Error('Failed to find TikTok video links on the search page.');
+  if (urls.size === 0 && skippedIds.size === 0) {
+    throw new Error('Failed to find TikTok video links on the search page.');
+  }
 
   const collected = Array.from(urls).slice(0, maxVideos);
-  console.log(`Collected ${collected.length} video URL(s) from search results.`);
-  return collected;
+  console.log(`Collected ${collected.length} new video URL(s) from search results.`);
+  if (skippedIds.size > 0) console.log(`Skipped ${skippedIds.size} previously scraped video(s).`);
+  return { urls: collected, skippedExisting: skippedIds.size };
 }
 
 async function assertTikTokAccess(page: Page, status: number | null): Promise<void> {
@@ -480,6 +499,12 @@ export async function scrapeTikTok(options: ScrapeOptions): Promise<ScrapeResult
   const startedAt = nowIso();
   const startMs = Date.now();
   let browser: Browser | null = null;
+  const scrapedVideoIds = options.skipExisting
+    ? await loadScrapedVideoIds(options.registryPath)
+    : new Set<string>();
+  if (options.skipExisting) {
+    console.log(`Loaded ${scrapedVideoIds.size} scraped video ID(s) from ${path.resolve(options.registryPath)}.`);
+  }
 
   const result: ScrapeResult = {
     query: options.search,
@@ -492,10 +517,13 @@ export async function scrapeTikTok(options: ScrapeOptions): Promise<ScrapeResult
       commentsPerVideo: options.commentsPerVideo,
       headless: options.headless,
       downloadVideo: options.downloadVideo,
+      skipExisting: options.skipExisting,
+      registryPath: options.registryPath,
     },
     metrics: {
       videosTargeted: options.maxVideos,
       videosScraped: 0,
+      videosSkippedExisting: 0,
       totalComments: 0,
       navFailures: 0,
       captchasDetected: 0,
@@ -526,7 +554,9 @@ export async function scrapeTikTok(options: ScrapeOptions): Promise<ScrapeResult
     await page.setDefaultNavigationTimeout(0);
     await page.setDefaultTimeout(30_000);
 
-    const videoUrls = await collectVideoUrlsFromSearch(page, options.search, options.maxVideos);
+    const discovery = await collectVideoUrlsFromSearch(page, options.search, options.maxVideos, scrapedVideoIds);
+    const videoUrls = discovery.urls;
+    result.metrics.videosSkippedExisting = discovery.skippedExisting;
     await closeExtraPages(browser, page);
 
     for (let index = 0; index < videoUrls.length; index += 1) {
@@ -559,6 +589,9 @@ export async function scrapeTikTok(options: ScrapeOptions): Promise<ScrapeResult
       result.items.push(video);
       result.metrics.videosScraped = result.items.length;
       result.metrics.totalComments += video.comments.length;
+      if (video.videoId && options.skipExisting) {
+        await saveScrapedVideoId(scrapedVideoIds, video.videoId, options.registryPath);
+      }
 
       await sleep(600);
     }

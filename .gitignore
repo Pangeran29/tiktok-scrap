@@ -2,6 +2,7 @@ dist/
 node_modules/
 output/
 downloads/
+data/
 .chrome-profile/
 .chrome-profile-smoke/
 .env
