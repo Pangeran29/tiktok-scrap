@@ -1,70 +1,128 @@
 # Optimized TikTok Scraper
 
-Direct TypeScript CLI for scraping TikTok search results. This folder is standalone and does not use NestJS.
+Direct TypeScript CLI for scraping TikTok video search results. It does not use NestJS.
 
 ## Install
 
 ```bash
-cd optimized
 npm install
 ```
 
-## Run
+## Basic Usage
+
+Every scrape requires `--search`, `--max`, and `--comments`:
 
 ```bash
-npm run scrape -- --search "science fact" --max 10 --comments 50 --keyword "body"
+npm run scrape -- --search "curanmor" --max 5 --comments 50
 ```
 
-By default Chrome opens visibly so TikTok login, captcha, and page behavior can be inspected. The `scrape` script compiles TypeScript first, then runs the compiled CLI to avoid browser-evaluation issues from runtime TS transpilers.
-
-## Smoke Test
+Use `--comments 0` when comments are not needed:
 
 ```bash
-npm run scrape -- --search "science fact" --keyword "body" --max 2 --comments 5
+npm run scrape -- --search "curanmor" --max 5 --comments 0
 ```
 
-## Open TikTok Only
+By default Chrome is visible, videos are not downloaded, and previously scraped IDs are not skipped.
 
-Use this when you want to inspect TikTok login, captcha, search rendering, or account state without scraping:
+## CLI Reference
+
+### Required For Scraping
+
+| Option | Description |
+|---|---|
+| `--search <text>` | TikTok video-search query. |
+| `--max <number>` | Number of new video results to scrape. |
+| `--comments <number>` | Maximum comments per video. Use `0` to disable comment scraping. |
+
+### Optional
+
+| Option | Default | Description |
+|---|---:|---|
+| `--keyword <text>` | None | Sets `keywordMentioned` when found in the caption or scraped comments. |
+| `--headless` | Off | Runs Chrome without a visible window. Visible mode is generally more reliable for TikTok. |
+| `--keep-browser-open` | Off | Keeps the Puppeteer Chrome process open after completion. |
+| `--download-video` | Off | Downloads each available video into `downloads/`. |
+| `--skip-existing` | Off | Skips IDs already present in the registry and records successfully scraped IDs. |
+| `--registry <path>` | `data/scraped-video-ids.json` | Selects the local ID registry used with `--skip-existing`. |
+| `--output <path>` | Timestamped JSON | Selects the scrape result JSON path. |
+| `--open-only` | Off | Opens TikTok for inspection without scraping. With `--search`, opens the video-search page. |
+
+`--open-only` does not require `--max` or `--comments`:
 
 ```bash
 npm run scrape -- --open-only
 npm run scrape -- --open-only --search "curanmor"
 ```
 
-With `--search`, this opens TikTok's video search route: `https://www.tiktok.com/search/video?q=<query>`.
-
 Chrome stays open until you stop the terminal with `Ctrl+C`.
 
-## CLI Flags
+## Common Commands
 
-- `--search <text>`: required search query.
-- `--max <number>`: required number of videos to scrape.
-- `--comments <number>`: required number of comments per video; use `0` to disable comments.
-- `--keyword <text>`: optional keyword used for `keywordMentioned`.
-- `--headless`: run Chrome headless.
-- `--keep-browser-open`: leave Chrome open after the run.
-- `--output <path>`: custom JSON output path.
-- `--open-only`: open TikTok or a TikTok video search page and do not scrape.
-- `--download-video`: save each scraped video to `downloads/` when TikTok exposes a playable video URL.
-- `--registry <path>`: choose the scraped-video ID JSON file, default `data/scraped-video-ids.json`.
-- `--skip-existing`: skip video IDs already recorded in the local registry and save newly scraped IDs.
-
-Downloaded items include `videoDownloadUrl` (the resolved TikTok CDN URL) and `videoFile` (the local saved path). TikTok CDN URLs are signed and may expire.
-
-Results are written to `output/tiktok-scrape-YYYYMMDD-HHmmss.json` unless `--output` is provided.
-
-By default, the registry is not used and matching videos may be scraped again. Add `--skip-existing` to load `data/scraped-video-ids.json`, exclude recorded IDs, and save newly scraped IDs. The entire `data/` directory is ignored by Git.
-
-Example with a custom local registry:
+Scrape five videos with comments:
 
 ```bash
-npm run scrape -- --search "curanmor" --max 20 --comments 50 --skip-existing --registry data/curanmor-ids.json
+npm run scrape -- --search "curanmor" --max 5 --comments 50
 ```
+
+Scrape five unique videos and download them:
+
+```bash
+npm run scrape -- \
+  --search "curanmor" \
+  --max 5 \
+  --comments 50 \
+  --skip-existing \
+  --download-video
+```
+
+Use a separate registry for one query:
+
+```bash
+npm run scrape -- \
+  --search "curanmor" \
+  --max 20 \
+  --comments 0 \
+  --skip-existing \
+  --registry data/curanmor-ids.json
+```
+
+Write results to a custom file:
+
+```bash
+npm run scrape -- \
+  --search "curanmor" \
+  --max 5 \
+  --comments 10 \
+  --output output/curanmor.json
+```
+
+## Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `HEADLESS` | `0` | Set to `1` or `true` to enable headless mode. The `--headless` flag also enables it. |
+| `KEEP_BROWSER_OPEN` | `0` | Set to `1` to keep Chrome open after scraping. |
+| `CHROME_USER_DATA_DIR` | `.chrome-profile` | Persistent Chrome profile directory. |
+| `VIDEO_REGISTRY_PATH` | `data/scraped-video-ids.json` | Default registry path when `--registry` is omitted. |
+
+## Generated Files
+
+- `output/tiktok-scrape-YYYYMMDD-HHmmss.json`: scrape results.
+- `downloads/*.mp4`: downloaded videos when `--download-video` is enabled.
+- `data/scraped-video-ids.json`: local deduplication registry when `--skip-existing` is enabled.
+- `.chrome-profile/`: persistent TikTok browser session.
+
+These runtime directories are ignored by Git.
+
+Each downloaded item includes:
+
+- `videoDownloadUrl`: resolved signed TikTok CDN URL. It may expire.
+- `videoFile`: local downloaded file path.
+- `downloadError`: present when downloading fails.
 
 ## Scripts
 
 ```bash
-npm run scrape -- --search "your query" --max 10 --comments 50
 npm run build
+npm run scrape -- --search "curanmor" --max 5 --comments 50
 ```
