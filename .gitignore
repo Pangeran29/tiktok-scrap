@@ -3,6 +3,7 @@ node_modules/
 output/
 downloads/
 data/
+debug/
 .chrome-profile/
 .chrome-profile-smoke/
 .env

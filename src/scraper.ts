@@ -3,14 +3,23 @@ import { createWriteStream } from 'node:fs';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 
 import puppeteer from 'puppeteer-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
-import type { Browser, Page } from 'puppeteer';
+import type { Browser, HTTPResponse, Page } from 'puppeteer';
 
 import { extractComments } from './comments';
 import type { ScrapeOptions, ScrapeResult, ScrapedVideo, VideoStats } from './types';
-import { buildSearchUrl, isKeywordMentioned, normalizeVideoUrl, nowIso, sleep } from './utils';
+import {
+  buildSearchUrl,
+  normalizeVideoUrl,
+  nowIso,
+  randomInteger,
+  sleep,
+  timestampForFile,
+} from './utils';
 import { loadScrapedVideoIds, saveScrapedVideoId } from './video-registry';
 
 puppeteer.use(StealthPlugin());
@@ -20,6 +29,60 @@ type OEmbed = {
   author_name?: string;
   author_url?: string;
 };
+
+const V2_TIMING = {
+  homepageSettle: [1_200, 2_200],
+  typingDelay: [55, 145],
+  searchSettle: [1_500, 2_800],
+  tabSettle: [1_000, 2_000],
+  viewerDwell: [700, 1_400],
+  transitionSettle: [900, 1_800],
+} as const;
+
+const V2_MAX_VIEWER_POSITIONS_FACTOR = 8;
+const V2_MAX_REPEATED_IDS = 3;
+const execFileAsync = promisify(execFile);
+const mediaResponsesByPage = new WeakMap<Page, string[]>();
+
+function trackMediaResponses(page: Page): void {
+  mediaResponsesByPage.set(page, []);
+  page.on('response', (response: HTTPResponse) => {
+    const url = response.url();
+    const contentType = response.headers()['content-type']?.toLowerCase() || '';
+    const lower = url.toLowerCase();
+    if (
+      !url.startsWith('http') ||
+      (!contentType.startsWith('video/') &&
+        !lower.includes('mime_type=video') &&
+        !lower.includes('/video/tos/') &&
+        !lower.includes('/obj/tos-') &&
+        !lower.includes('.mp4'))
+    ) {
+      return;
+    }
+    const urls = mediaResponsesByPage.get(page);
+    if (urls && !urls.includes(url)) urls.push(url);
+  });
+}
+
+async function resetMediaResponses(page: Page): Promise<void> {
+  mediaResponsesByPage.set(page, []);
+  await page.evaluate(() => performance.clearResourceTimings()).catch(() => undefined);
+}
+
+export function videoIdFromUrl(url: string): string | null {
+  return url.match(/\/video\/(\d+)/)?.[1] ?? null;
+}
+
+export function didVideoChange(previousUrl: string, currentUrl: string): boolean {
+  const previousId = videoIdFromUrl(previousUrl);
+  const currentId = videoIdFromUrl(currentUrl);
+  return Boolean(previousId && currentId && previousId !== currentId);
+}
+
+async function randomSleep(range: readonly [number, number]): Promise<void> {
+  await sleep(randomInteger(range[0], range[1]));
+}
 
 async function fetchOEmbed(videoUrl: string): Promise<OEmbed | null> {
   try {
@@ -201,7 +264,7 @@ async function closeExtraPages(browser: Browser, mainPage: Page): Promise<void> 
   );
 }
 
-async function extractVideo(page: Page, keyword: string | null, commentsLimit: number): Promise<ScrapedVideo> {
+async function extractVideo(page: Page, commentsLimit: number): Promise<ScrapedVideo> {
   const currentUrl = page.url();
   const normalizedUrl = normalizeVideoUrl(currentUrl);
   const oembed = await fetchOEmbed(normalizedUrl ?? currentUrl);
@@ -249,11 +312,27 @@ async function extractVideo(page: Page, keyword: string | null, commentsLimit: n
       break;
     }
 
+    const visibleVideos = Array.from(document.querySelectorAll('video')) as HTMLVideoElement[];
+    const activeVideo =
+      visibleVideos
+        .filter((video) => {
+          const rect = video.getBoundingClientRect();
+          const style = getComputedStyle(video);
+          return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+        })
+        .sort((a, b) => {
+          const aRect = a.getBoundingClientRect();
+          const bRect = b.getBoundingClientRect();
+          const aScore = (a.paused ? 0 : 1_000_000_000) + aRect.width * aRect.height;
+          const bScore = (b.paused ? 0 : 1_000_000_000) + bRect.width * bRect.height;
+          return bScore - aScore;
+        })[0] ?? null;
+
     return {
       caption,
       username,
       authorUrl,
-      videoSrc: (document.querySelector('video') as HTMLVideoElement | null)?.currentSrc ?? null,
+      videoSrc: activeVideo?.currentSrc || activeVideo?.src || null,
       ogTitle: document.querySelector('meta[property="og:title"]')?.getAttribute('content') ?? document.title ?? null,
       metaDesc:
         document.querySelector('meta[property="og:description"]')?.getAttribute('content') ??
@@ -279,16 +358,13 @@ async function extractVideo(page: Page, keyword: string | null, commentsLimit: n
   return {
     videoId: (normalizedUrl ?? currentUrl).match(/\/video\/(\d+)/)?.[1] ?? null,
     url: normalizedUrl ?? domData.url ?? currentUrl,
-    title: domData.ogTitle ?? caption ?? normalizedUrl ?? currentUrl,
     caption,
-    description: caption,
     username,
     authorUrl,
     videoSrc: domData.videoSrc,
     videoDownloadUrl: null,
     videoFile: null,
     stats,
-    keywordMentioned: isKeywordMentioned(caption, comments, keyword),
     comments,
   };
 }
@@ -397,25 +473,41 @@ async function downloadVideo(
   video: ScrapedVideo,
 ): Promise<{ filePath: string | null; downloadUrl: string | null; error?: string }> {
   try {
-    const downloadUrl = await resolveVideoDownloadUrl(page, video.videoSrc);
-    if (!downloadUrl) {
-      throw new Error('Could not resolve the underlying TikTok CDN video URL.');
-    }
-
     const videoId = video.url.match(/\/video\/(\d+)/)?.[1] || String(Date.now());
     const username = sanitizeFilename(video.username || 'tiktok');
     const relativePath = path.join('downloads', `${username}-${videoId}.mp4`);
     const absolutePath = path.resolve(relativePath);
-
     await fs.mkdir(path.dirname(absolutePath), { recursive: true });
+
+    if (video.videoSrc?.startsWith('blob:')) {
+      try {
+        await streamBlobVideo(page, video.videoSrc, absolutePath);
+        console.log(`Downloaded active viewer video: ${relativePath}`);
+        return { filePath: relativePath, downloadUrl: video.videoSrc };
+      } catch {
+        // TikTok commonly uses a MediaSource blob that cannot be fetched directly.
+      }
+    }
 
     const cookies = await page.cookies();
     const userAgent = await page.evaluate(() => navigator.userAgent).catch(() => 'Mozilla/5.0');
+    const requestHeaders = {
+      Cookie: cookies.map((cookie) => `${cookie.name}=${cookie.value}`).join('; '),
+      Referer: video.url,
+      'User-Agent': userAgent,
+    };
+    const downloadUrl =
+      (await resolveVideoUrlFromItemApi(page, videoId)) ??
+      (await resolveVideoUrlFromCanonicalPage(video.url, requestHeaders)) ??
+      (await resolveVideoUrlByDuration(page, requestHeaders)) ??
+      (await resolveVideoDownloadUrl(page, video.videoSrc));
+    if (!downloadUrl) {
+      throw new Error('Could not resolve the underlying TikTok CDN video URL.');
+    }
+
     const response = await fetch(downloadUrl, {
       headers: {
-        Cookie: cookies.map((cookie) => `${cookie.name}=${cookie.value}`).join('; '),
-        Referer: video.url,
-        'User-Agent': userAgent,
+        ...requestHeaders,
         Accept: 'video/mp4,video/*,*/*',
       },
     });
@@ -440,23 +532,304 @@ async function downloadVideo(
   }
 }
 
+async function resolveVideoUrlByDuration(page: Page, headers: Record<string, string>): Promise<string | null> {
+  const candidates = mediaResponsesByPage.get(page) ?? [];
+  if (candidates.length === 0) return null;
+
+  const activeDuration = await page.evaluate(() => {
+    const videos = Array.from(document.querySelectorAll('video')) as HTMLVideoElement[];
+    const active = videos
+      .filter((video) => {
+        const rect = video.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0 && Number.isFinite(video.duration) && video.duration > 0;
+      })
+      .sort((a, b) => {
+        const aRect = a.getBoundingClientRect();
+        const bRect = b.getBoundingClientRect();
+        const aScore = (a.paused ? 0 : 1_000_000_000) + aRect.width * aRect.height;
+        const bScore = (b.paused ? 0 : 1_000_000_000) + bRect.width * bRect.height;
+        return bScore - aScore;
+      })[0];
+    return active?.duration ?? null;
+  });
+  if (!activeDuration) return null;
+
+  const headerText = Object.entries(headers)
+    .map(([name, value]) => `${name}: ${value}\r\n`)
+    .join('');
+  let best: { url: string; difference: number } | null = null;
+
+  for (const candidate of candidates) {
+    try {
+      const { stdout } = await execFileAsync(
+        'ffprobe',
+        [
+          '-v',
+          'error',
+          '-headers',
+          headerText,
+          '-show_entries',
+          'format=duration',
+          '-of',
+          'default=noprint_wrappers=1:nokey=1',
+          candidate,
+        ],
+        { timeout: 15_000, maxBuffer: 1024 * 1024 },
+      );
+      const duration = Number(stdout.trim());
+      if (!Number.isFinite(duration)) continue;
+      const difference = Math.abs(duration - activeDuration);
+      if (!best || difference < best.difference) best = { url: candidate, difference };
+    } catch {
+      // Ignore candidates that cannot be probed.
+    }
+  }
+
+  return best && best.difference <= 1.5 ? best.url : null;
+}
+
+async function resolveVideoUrlFromItemApi(page: Page, videoId: string): Promise<string | null> {
+  return page.evaluate(async (id) => {
+    try {
+      const response = await fetch(`/api/item/detail/?itemId=${encodeURIComponent(id)}`, {
+        credentials: 'include',
+        headers: { Accept: 'application/json, text/plain, */*' },
+      });
+      if (!response.ok) return null;
+      const payload = (await response.json()) as {
+        itemInfo?: {
+          itemStruct?: {
+            id?: string;
+            video?: {
+              playAddr?: string;
+              downloadAddr?: string;
+              playApi?: string;
+            };
+          };
+        };
+      };
+      const item = payload.itemInfo?.itemStruct;
+      if (item?.id !== id) return null;
+      return item.video?.playAddr ?? item.video?.downloadAddr ?? item.video?.playApi ?? null;
+    } catch {
+      return null;
+    }
+  }, videoId);
+}
+
+async function streamBlobVideo(page: Page, blobUrl: string, absolutePath: string): Promise<void> {
+  const callbackName = `__writeVideoChunk_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  const output = createWriteStream(absolutePath);
+
+  await page.exposeFunction(callbackName, async (base64Chunk: string) => {
+    const chunk = Buffer.from(base64Chunk, 'base64');
+    if (!output.write(chunk)) {
+      await new Promise<void>((resolve, reject) => {
+        output.once('drain', resolve);
+        output.once('error', reject);
+      });
+    }
+  });
+
+  try {
+    await page.evaluate(
+      async ({ source, callback }) => {
+        const response = await fetch(source);
+        if (!response.ok || !response.body) {
+          throw new Error(`Failed to read active video blob: HTTP ${response.status}`);
+        }
+
+        const reader = response.body.getReader();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          let binary = '';
+          const blockSize = 0x8000;
+          for (let offset = 0; offset < value.length; offset += blockSize) {
+            binary += String.fromCharCode(...value.subarray(offset, offset + blockSize));
+          }
+          await (window as unknown as Record<string, (chunk: string) => Promise<void>>)[callback](btoa(binary));
+        }
+      },
+      { source: blobUrl, callback: callbackName },
+    );
+
+    await new Promise<void>((resolve, reject) => {
+      output.end(resolve);
+      output.once('error', reject);
+    });
+  } catch (error) {
+    output.destroy();
+    await fs.rm(absolutePath, { force: true }).catch(() => undefined);
+    throw error;
+  } finally {
+    await page.removeExposedFunction(callbackName).catch(() => undefined);
+  }
+}
+
+function readVideoAddress(value: unknown): string | null {
+  if (typeof value === 'string') return value.startsWith('http') ? value : null;
+  if (Array.isArray(value)) {
+    for (const candidate of value) {
+      const address = readVideoAddress(candidate);
+      if (address) return address;
+    }
+    return null;
+  }
+  if (!value || typeof value !== 'object') return null;
+
+  const record = value as Record<string, unknown>;
+  for (const key of ['urlList', 'url_list', 'urls', 'url']) {
+    const address = readVideoAddress(record[key]);
+    if (address) return address;
+  }
+  return null;
+}
+
+function findVideoAddressById(root: unknown, videoId: string): string | null {
+  const pending: unknown[] = [root];
+  const visited = new Set<object>();
+
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (!current || typeof current !== 'object') continue;
+    if (visited.has(current)) continue;
+    visited.add(current);
+
+    if (!Array.isArray(current)) {
+      const record = current as Record<string, unknown>;
+      const currentId = String(
+        record.id ?? record.itemId ?? record.videoId ?? record.aweme_id ?? record.awemeId ?? '',
+      );
+      if (currentId === videoId) {
+        const video =
+          record.video && typeof record.video === 'object'
+            ? (record.video as Record<string, unknown>)
+            : record;
+        for (const key of ['playAddr', 'downloadAddr', 'playApi', 'play_addr', 'download_addr']) {
+          const address = readVideoAddress(video[key]);
+          if (address) return address.replace(/\\u002F/g, '/').replace(/\\u0026/g, '&').replace(/\\\//g, '/');
+        }
+      }
+    }
+
+    for (const child of Array.isArray(current) ? current : Object.values(current)) {
+      if (child && typeof child === 'object') pending.push(child);
+    }
+  }
+  return null;
+}
+
+async function resolveVideoUrlFromCanonicalPage(
+  videoUrl: string,
+  headers: Record<string, string>,
+): Promise<string | null> {
+  try {
+    const videoId = videoIdFromUrl(videoUrl);
+    if (!videoId) return null;
+
+    const response = await fetch(videoUrl, { headers });
+    if (!response.ok) return null;
+    const html = await response.text();
+
+    const scriptPattern = /<script\b[^>]*type=["']application\/json["'][^>]*>([\s\S]*?)<\/script>/gi;
+    for (const match of html.matchAll(scriptPattern)) {
+      const content = match[1]?.trim();
+      if (!content || !content.includes(videoId)) continue;
+      try {
+        const address = findVideoAddressById(JSON.parse(content), videoId);
+        if (address) return address;
+      } catch {
+        // Ignore non-standard JSON script payloads.
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 async function resolveVideoDownloadUrl(page: Page, videoSrc: string | null): Promise<string | null> {
   if (videoSrc?.startsWith('http')) return videoSrc;
 
   await sleep(1000);
 
-  return page.evaluate(() => {
-    const html = document.documentElement.innerHTML;
-    for (const key of ['playAddr', 'downloadAddr']) {
-      const match = html.match(new RegExp(`"${key}":"([^"]+)"`));
-      if (!match?.[1]) continue;
+  const pageUrl = await page.evaluate(() => {
+    const videoId = location.pathname.match(/\/video\/(\d+)/)?.[1] || '';
 
-      const decoded = match[1]
+    const decodeVideoUrl = (value: string) =>
+      value
         .replace(/\\u002F/g, '/')
         .replace(/\\u0026/g, '&')
         .replace(/\\\//g, '/');
-      if (decoded.startsWith('http')) return decoded;
+
+    const readAddress = (value: unknown): string | null => {
+      if (typeof value === 'string') return value.startsWith('http') ? decodeVideoUrl(value) : null;
+      if (!Array.isArray(value)) return null;
+      const address = value.find((candidate): candidate is string => typeof candidate === 'string' && candidate.startsWith('http'));
+      return address ? decodeVideoUrl(address) : null;
+    };
+
+    const findMatchingVideo = (root: unknown): string | null => {
+      const pending: unknown[] = [root];
+      const visited = new Set<object>();
+
+      while (pending.length > 0) {
+        const current = pending.pop();
+        if (!current || typeof current !== 'object') continue;
+        if (visited.has(current)) continue;
+        visited.add(current);
+
+        if (!Array.isArray(current)) {
+          const record = current as Record<string, unknown>;
+          const currentId = String(record.id ?? record.itemId ?? record.videoId ?? '');
+          if (currentId === videoId) {
+            const video = record.video && typeof record.video === 'object'
+              ? (record.video as Record<string, unknown>)
+              : record;
+            for (const key of ['playAddr', 'downloadAddr', 'playApi']) {
+              const address = readAddress(video[key]);
+              if (address) return address;
+            }
+          }
+        }
+
+        for (const child of Array.isArray(current) ? current : Object.values(current)) {
+          if (child && typeof child === 'object') pending.push(child);
+        }
+      }
+      return null;
+    };
+
+    const jsonScripts = Array.from(document.querySelectorAll('script[type="application/json"]'));
+    for (const script of jsonScripts) {
+      const content = script.textContent?.trim();
+      if (!content || !content.includes(videoId)) continue;
+      try {
+        const address = findMatchingVideo(JSON.parse(content));
+        if (address) return address;
+      } catch {
+        // Some application/json scripts contain non-standard payloads.
+      }
     }
+
+    const visibleVideos = Array.from(document.querySelectorAll('video')) as HTMLVideoElement[];
+    const activeVideo = visibleVideos
+      .filter((video) => {
+        const rect = video.getBoundingClientRect();
+        const style = getComputedStyle(video);
+        return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+      })
+      .sort((a, b) => {
+        const aRect = a.getBoundingClientRect();
+        const bRect = b.getBoundingClientRect();
+        const aScore = (a.paused ? 0 : 1_000_000_000) + aRect.width * aRect.height;
+        const bScore = (b.paused ? 0 : 1_000_000_000) + bRect.width * bRect.height;
+        return bScore - aScore;
+      })[0];
+    const activeSrc = activeVideo?.currentSrc || activeVideo?.src || '';
+    if (activeSrc.startsWith('http')) return activeSrc;
 
     const resourceUrls = performance
       .getEntriesByType('resource')
@@ -472,10 +845,13 @@ async function resolveVideoDownloadUrl(page: Page, videoSrc: string | null): Pro
         );
       });
 
-    if (resourceUrls.length > 0) return resourceUrls[resourceUrls.length - 1];
+    if (resourceUrls.length === 1) return resourceUrls[0];
 
     return null;
   });
+  if (pageUrl) return pageUrl;
+
+  return null;
 }
 
 function sanitizeFilename(value: string): string {
@@ -493,6 +869,362 @@ async function detectCaptcha(page: Page): Promise<boolean> {
     .$('iframe[src*="challenge"], iframe[title*="captcha"], div:has(> iframe[title*="captcha"])')
     .catch(() => null);
   return Boolean(challenge);
+}
+
+async function saveDebugArtifacts(page: Page, stage: string): Promise<void> {
+  const safeStage = stage.replace(/[^a-z0-9_-]+/gi, '-').replace(/^-+|-+$/g, '') || 'failure';
+  const directory = path.resolve('debug', `${timestampForFile()}-${safeStage}`);
+
+  try {
+    await fs.mkdir(directory, { recursive: true });
+    await Promise.all([
+      page.screenshot({ path: path.join(directory, 'page.png'), fullPage: true }),
+      fs.writeFile(path.join(directory, 'page.html'), await page.content(), 'utf8'),
+      fs.writeFile(
+        path.join(directory, 'context.json'),
+        `${JSON.stringify({ stage, url: page.url(), capturedAt: nowIso() }, null, 2)}\n`,
+        'utf8',
+      ),
+    ]);
+    console.error(`Debug artifacts: ${directory}`);
+  } catch (error) {
+    console.warn(`Failed to save debug artifacts: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+async function waitForSearchResults(page: Page): Promise<void> {
+  await page.waitForFunction(
+    () =>
+      location.pathname.startsWith('/search') &&
+      (document.querySelectorAll('a[href*="/video/"]').length > 0 ||
+        Boolean(document.querySelector('[data-e2e="search-video-item"]'))),
+    { timeout: 30_000 },
+  );
+}
+
+async function performHomepageSearch(page: Page, search: string): Promise<void> {
+  console.log('Opening TikTok homepage for v2 search.');
+  const navSearchSelector = 'button[data-e2e="nav-search"], [data-e2e="nav-search"]';
+  let navSearch = null;
+  for (let attempt = 1; attempt <= 2 && !navSearch; attempt += 1) {
+    const response = await page.goto('https://www.tiktok.com/', { waitUntil: 'domcontentloaded', timeout: 60_000 });
+    await assertTikTokAccess(page, response?.status() ?? null);
+    await randomSleep(V2_TIMING.homepageSettle);
+    await page
+      .waitForFunction(
+        (selector) =>
+          Array.from(document.querySelectorAll(selector)).some((element) => {
+            const rect = element.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0 && !element.hasAttribute('disabled');
+          }),
+        { timeout: 30_000 },
+        navSearchSelector,
+      )
+      .catch(() => undefined);
+
+    const navSearchCandidates = await page.$$(navSearchSelector);
+    for (const candidate of navSearchCandidates) {
+      const visible = await candidate.evaluate((element) => {
+        const rect = element.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0 && !element.hasAttribute('disabled');
+      });
+      if (visible) {
+        navSearch = candidate;
+        break;
+      }
+    }
+    if (!navSearch && attempt === 1) {
+      console.warn('TikTok homepage search did not render; reloading once.');
+      await randomSleep([1_000, 2_000]);
+    }
+  }
+  if (!navSearch) throw new Error('V2 could not locate the TikTok navigation search button.');
+
+  const searchSelector = 'form[data-e2e="search-box"] input[data-e2e="search-user-input"]';
+  const visibleSearchInput = (timeout: number) =>
+    page
+      .waitForFunction(
+        (selector) =>
+          Array.from(document.querySelectorAll(selector)).some((element) => {
+            const rect = element.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0 && !element.hasAttribute('disabled');
+          }),
+        { timeout },
+        searchSelector,
+      )
+      .then(() => true)
+      .catch(() => false);
+
+  await navSearch.click();
+  await randomSleep([350, 800]);
+  let searchOpened = await visibleSearchInput(4_000);
+
+  if (!searchOpened) {
+    const box = await navSearch.boundingBox();
+    if (!box) throw new Error('V2 navigation search button was not clickable.');
+    console.warn('TikTok ignored the first Search click; retrying with a coordinate click.');
+    await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+    await randomSleep([500, 1_000]);
+    searchOpened = await visibleSearchInput(10_000);
+  }
+
+  if (!searchOpened) throw new Error('V2 Search button did not open the search input.');
+
+  const searchInputs = await page.$$(searchSelector);
+  let input = null;
+  for (const candidate of searchInputs) {
+    const visible = await candidate.evaluate((element) => {
+      const rect = element.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0 && !element.hasAttribute('disabled');
+    });
+    if (visible) {
+      input = candidate;
+      break;
+    }
+  }
+  if (!input) throw new Error('V2 could not locate the opened TikTok search input.');
+  let typedValue = '';
+  for (let attempt = 1; attempt <= 2 && typedValue.trim() !== search; attempt += 1) {
+    await input.click({ clickCount: 3 });
+    const selectModifier = process.platform === 'darwin' ? 'Meta' : 'Control';
+    await page.keyboard.down(selectModifier);
+    await page.keyboard.press('A');
+    await page.keyboard.up(selectModifier);
+    await page.keyboard.press('Backspace');
+    await input.type(search, { delay: randomInteger(V2_TIMING.typingDelay[0], V2_TIMING.typingDelay[1]) });
+    await randomSleep([250, 650]);
+    typedValue = await input.evaluate((element) => (element as HTMLInputElement).value);
+    if (typedValue.trim() !== search && attempt === 1) {
+      console.warn('TikTok search input lost focus while typing; retrying once.');
+    }
+  }
+
+  if (typedValue.trim() !== search) {
+    throw new Error(`V2 search input did not receive the expected query "${search}" (received "${typedValue}").`);
+  }
+
+  await page.keyboard.press('Enter');
+  await waitForSearchResults(page);
+  await randomSleep(V2_TIMING.searchSettle);
+}
+
+async function selectVideosTab(page: Page): Promise<void> {
+  const candidates = await page.$$('[role="tab"], a, button');
+  let videosTab = null;
+  for (const candidate of candidates) {
+    const isVideosTab = await candidate.evaluate((element) => {
+      const htmlElement = element as HTMLElement;
+      const text = (htmlElement.innerText || htmlElement.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+      const rect = htmlElement.getBoundingClientRect();
+      return text === 'videos' && rect.width > 0 && rect.height > 0;
+    });
+    if (isVideosTab) {
+      videosTab = candidate;
+      break;
+    }
+  }
+  if (!videosTab) throw new Error('V2 could not locate the Videos search tab.');
+
+  await videosTab.click();
+  await page.waitForFunction(() => location.pathname === '/search/video', { timeout: 15_000 });
+  const loaded = await waitForSearchResults(page)
+    .then(() => true)
+    .catch(() => false);
+  if (!loaded) {
+    console.warn('TikTok Videos tab was active but results stayed blank; reloading the same tab once.');
+    await page.reload({ waitUntil: 'domcontentloaded', timeout: 60_000 });
+    await waitForSearchResults(page);
+  }
+  await randomSleep(V2_TIMING.tabSettle);
+  console.log(`Videos tab active: ${page.url()}`);
+}
+
+async function openFirstVideoFromResults(page: Page): Promise<void> {
+  if (new URL(page.url()).pathname !== '/search/video') {
+    throw new Error(`V2 refused to open a result before the Videos tab was active: ${page.url()}`);
+  }
+
+  const links = await page.$$('a[href*="/video/"]');
+  for (const link of links) {
+    const visible = await link
+      .evaluate((element) => {
+        const rect = element.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      })
+      .catch(() => false);
+    if (!visible) continue;
+
+    await resetMediaResponses(page);
+    await link.click();
+    await page.waitForFunction(
+      () =>
+        /\/video\/\d+/.test(location.href) &&
+        (Boolean(document.querySelector('video')) || Boolean(document.querySelector('[data-e2e="video-desc"]'))),
+      { timeout: 20_000 },
+    );
+    await randomSleep(V2_TIMING.viewerDwell);
+    return;
+  }
+  throw new Error('V2 could not find a visible video result to open.');
+}
+
+async function clickNextVideoControl(page: Page): Promise<boolean> {
+  return page.evaluate(() => {
+    const candidates = Array.from(document.querySelectorAll('button, [role="button"]')) as HTMLElement[];
+    const control = candidates.find((element) => {
+      const aria = (element.getAttribute('aria-label') || '').toLowerCase();
+      const title = (element.getAttribute('title') || '').toLowerCase();
+      const testId = (element.getAttribute('data-e2e') || '').toLowerCase();
+      const combined = `${aria} ${title} ${testId}`;
+      const rect = element.getBoundingClientRect();
+      return (
+        rect.width > 0 &&
+        rect.height > 0 &&
+        (/next|down/.test(combined) || /arrow-down|arrowdown/.test(element.innerHTML.toLowerCase()))
+      );
+    });
+    control?.click();
+    return Boolean(control);
+  });
+}
+
+async function waitForVideoChange(page: Page, previousUrl: string, timeout: number): Promise<boolean> {
+  return page
+    .waitForFunction(
+      (previous) => {
+        const previousId = previous.match(/\/video\/(\d+)/)?.[1];
+        const currentId = location.href.match(/\/video\/(\d+)/)?.[1];
+        return Boolean(previousId && currentId && previousId !== currentId);
+      },
+      { timeout },
+      previousUrl,
+    )
+    .then(() => true)
+    .catch(() => false);
+}
+
+async function advanceViewer(page: Page): Promise<void> {
+  const previousUrl = page.url();
+  await resetMediaResponses(page);
+  await page.keyboard.press('ArrowDown');
+  let changed = await waitForVideoChange(page, previousUrl, 5_000);
+
+  if (!changed) {
+    const clicked = await clickNextVideoControl(page);
+    if (!clicked) throw new Error('V2 could not locate a next/down viewer control after ArrowDown failed.');
+    changed = await waitForVideoChange(page, previousUrl, 8_000);
+  }
+
+  if (!changed || !didVideoChange(previousUrl, page.url())) {
+    throw new Error(`V2 viewer did not advance from ${previousUrl}.`);
+  }
+  await randomSleep(V2_TIMING.transitionSettle);
+}
+
+async function handleCaptcha(page: Page, result: ScrapeResult): Promise<void> {
+  if (!(await detectCaptcha(page))) return;
+
+  result.metrics.captchasDetected += 1;
+  console.warn('Captcha detected. Solve it in Chrome, then press Enter here.');
+  await new Promise<void>((resolve) => {
+    process.stdin.resume();
+    process.stdin.once('data', () => {
+      process.stdin.pause();
+      resolve();
+    });
+  });
+}
+
+async function appendCurrentVideo(
+  page: Page,
+  options: ScrapeOptions,
+  result: ScrapeResult,
+  scrapedVideoIds: Set<string>,
+  useViewerPacing = false,
+): Promise<void> {
+  console.log(`Scraping video ${result.items.length + 1}/${options.maxVideos}: ${page.url()}`);
+  if (useViewerPacing) await randomSleep(V2_TIMING.viewerDwell);
+  const video = await extractVideo(page, options.commentsPerVideo);
+
+  if (options.downloadVideo) {
+    const download = await downloadVideo(page, video);
+    video.videoFile = download.filePath;
+    video.videoDownloadUrl = download.downloadUrl;
+    if (download.error) video.downloadError = download.error;
+  }
+
+  result.items.push(video);
+  result.metrics.videosScraped = result.items.length;
+  result.metrics.totalComments += video.comments.length;
+  if (video.videoId && options.skipExisting) {
+    await saveScrapedVideoId(scrapedVideoIds, video.videoId, options.registryPath);
+  }
+}
+
+async function scrapeWithV1(
+  browser: Browser,
+  page: Page,
+  options: ScrapeOptions,
+  result: ScrapeResult,
+  scrapedVideoIds: Set<string>,
+): Promise<void> {
+  const discovery = await collectVideoUrlsFromSearch(page, options.search, options.maxVideos, scrapedVideoIds);
+  result.metrics.videosSkippedExisting = discovery.skippedExisting;
+  await closeExtraPages(browser, page);
+
+  for (const videoUrl of discovery.urls) {
+    await resetMediaResponses(page);
+    await openVideo(page, videoUrl);
+    await closeExtraPages(browser, page);
+    await handleCaptcha(page, result);
+    await appendCurrentVideo(page, options, result, scrapedVideoIds);
+    await sleep(600);
+  }
+}
+
+async function scrapeWithV2(
+  browser: Browser,
+  page: Page,
+  options: ScrapeOptions,
+  result: ScrapeResult,
+  scrapedVideoIds: Set<string>,
+): Promise<void> {
+  await performHomepageSearch(page, options.search);
+  await selectVideosTab(page);
+  await openFirstVideoFromResults(page);
+  await closeExtraPages(browser, page);
+
+  const seenPositions = new Set<string>();
+  let repeatedPositions = 0;
+  const maxPositions = Math.max(20, options.maxVideos * V2_MAX_VIEWER_POSITIONS_FACTOR);
+
+  for (let position = 0; position < maxPositions && result.items.length < options.maxVideos; position += 1) {
+    await handleCaptcha(page, result);
+    const videoId = videoIdFromUrl(page.url());
+    if (!videoId) throw new Error(`V2 viewer URL does not contain a video ID: ${page.url()}`);
+
+    if (seenPositions.has(videoId)) {
+      repeatedPositions += 1;
+      if (repeatedPositions >= V2_MAX_REPEATED_IDS) {
+        throw new Error(`V2 viewer repeated video ${videoId} too many times.`);
+      }
+    } else {
+      seenPositions.add(videoId);
+      repeatedPositions = 0;
+      if (options.skipExisting && scrapedVideoIds.has(videoId)) {
+        result.metrics.videosSkippedExisting += 1;
+        console.log(`Skipping previously scraped video ${videoId}.`);
+      } else {
+        await appendCurrentVideo(page, options, result, scrapedVideoIds, true);
+      }
+    }
+
+    if (result.items.length < options.maxVideos) await advanceViewer(page);
+  }
+
+  if (result.items.length < options.maxVideos) {
+    throw new Error(`V2 exhausted ${maxPositions} viewer positions before scraping ${options.maxVideos} new videos.`);
+  }
 }
 
 export async function scrapeTikTok(options: ScrapeOptions): Promise<ScrapeResult> {
@@ -513,6 +1245,7 @@ export async function scrapeTikTok(options: ScrapeOptions): Promise<ScrapeResult
     endedAt: '',
     durationMs: 0,
     settings: {
+      flow: options.flow,
       maxVideos: options.maxVideos,
       commentsPerVideo: options.commentsPerVideo,
       headless: options.headless,
@@ -535,66 +1268,38 @@ export async function scrapeTikTok(options: ScrapeOptions): Promise<ScrapeResult
     browser = await puppeteer.launch({
       headless: options.headless,
       userDataDir: process.env.CHROME_USER_DATA_DIR || '.chrome-profile',
-      defaultViewport: null,
-      devtools: !options.headless,
+      defaultViewport: { width: 1366, height: 850, deviceScaleFactor: 1 },
+      devtools: false,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
         '--lang=en-US,en;q=0.9',
+        '--window-size=1440,1000',
       ],
     });
 
     const existingPages = await browser.pages();
     const page = existingPages[0] ?? (await browser.newPage());
     await closeExtraPages(browser, page);
+    trackMediaResponses(page);
 
     await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
     await page.setViewport({ width: 1366, height: 850, deviceScaleFactor: 1 });
     await page.setDefaultNavigationTimeout(0);
     await page.setDefaultTimeout(30_000);
 
-    const discovery = await collectVideoUrlsFromSearch(page, options.search, options.maxVideos, scrapedVideoIds);
-    const videoUrls = discovery.urls;
-    result.metrics.videosSkippedExisting = discovery.skippedExisting;
-    await closeExtraPages(browser, page);
-
-    for (let index = 0; index < videoUrls.length; index += 1) {
-      const videoUrl = videoUrls[index];
-      await openVideo(page, videoUrl);
-      await closeExtraPages(browser, page);
-
-      if (await detectCaptcha(page)) {
-        result.metrics.captchasDetected += 1;
-        console.warn('Captcha detected. Solve it in Chrome, then press Enter here.');
-        await new Promise<void>((resolve) => {
-          process.stdin.resume();
-          process.stdin.once('data', () => {
-            process.stdin.pause();
-            resolve();
-          });
-        });
-      }
-
-      console.log(`Scraping video ${index + 1}/${options.maxVideos}: ${page.url()}`);
-      const video = await extractVideo(page, options.keyword, options.commentsPerVideo);
-
-      if (options.downloadVideo) {
-        const download = await downloadVideo(page, video);
-        video.videoFile = download.filePath;
-        video.videoDownloadUrl = download.downloadUrl;
-        if (download.error) video.downloadError = download.error;
-      }
-
-      result.items.push(video);
-      result.metrics.videosScraped = result.items.length;
-      result.metrics.totalComments += video.comments.length;
-      if (video.videoId && options.skipExisting) {
-        await saveScrapedVideoId(scrapedVideoIds, video.videoId, options.registryPath);
-      }
-
-      await sleep(600);
+    if (options.flow === 'v1') {
+      await scrapeWithV1(browser, page, options, result, scrapedVideoIds);
+    } else {
+      await scrapeWithV2(browser, page, options, result, scrapedVideoIds);
     }
+  } catch (error) {
+    result.metrics.navFailures += 1;
+    const pages = browser ? await browser.pages().catch(() => []) : [];
+    const activePage = pages.find((candidate) => !candidate.isClosed());
+    if (activePage) await saveDebugArtifacts(activePage, `${options.flow}-navigation`);
+    throw error;
   } finally {
     result.endedAt = nowIso();
     result.durationMs = Date.now() - startMs;

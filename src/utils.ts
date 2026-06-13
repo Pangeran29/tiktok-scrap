@@ -6,6 +6,13 @@ export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+export function randomInteger(min: number, max: number, random = Math.random): number {
+  if (!Number.isInteger(min) || !Number.isInteger(max) || min > max) {
+    throw new Error('Invalid random integer range');
+  }
+  return Math.floor(random() * (max - min + 1)) + min;
+}
+
 export function nowIso(): string {
   return new Date().toISOString();
 }

@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
-import type { CliOptions } from './types';
+import type { CliOptions, ScrapeFlow } from './types';
 import { openTikTokForDebug, scrapeTikTok } from './scraper';
 import { defaultOutputPath, parsePositiveInteger } from './utils';
 import { DEFAULT_REGISTRY_PATH } from './video-registry';
@@ -31,7 +31,13 @@ export function parseCliArgs(args: string[], env = process.env): CliOptions {
   const comments = readFlag(args, 'comments');
   if (comments === undefined) throw new Error('--comments is required');
 
+  const flowValue = readFlag(args, 'flow') ?? 'v2';
+  if (flowValue !== 'v1' && flowValue !== 'v2') {
+    throw new Error('--flow must be either v1 or v2');
+  }
+
   return {
+    flow: flowValue as ScrapeFlow,
     search,
     keyword: readFlag(args, 'keyword')?.trim() || null,
     maxVideos: parsePositiveInteger(max, 0, 'max'),
@@ -58,6 +64,7 @@ async function main() {
   const outputPath = path.resolve(options.output ?? defaultOutputPath());
 
   console.log(`Search: ${options.search}`);
+  console.log(`Flow: ${options.flow}`);
   if (options.keyword) console.log(`Keyword: ${options.keyword}`);
   console.log(`Max videos: ${options.maxVideos}`);
   console.log(`Comments per video: ${options.commentsPerVideo}`);

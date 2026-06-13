@@ -2,6 +2,10 @@
 
 Direct TypeScript CLI for scraping TikTok video search results. It does not use NestJS.
 
+The default `v2` flow opens TikTok's homepage, performs the search through the UI,
+selects the Videos tab, and advances through the video viewer. The original
+direct-search implementation remains available as `v1`.
+
 ## Install
 
 ```bash
@@ -38,7 +42,8 @@ By default Chrome is visible, videos are not downloaded, and previously scraped 
 
 | Option | Default | Description |
 |---|---:|---|
-| `--keyword <text>` | None | Sets `keywordMentioned` when found in the caption or scraped comments. |
+| `--keyword <text>` | None | Records optional keyword metadata for the scrape run. |
+| `--flow <v1|v2>` | `v2` | Selects the homepage/viewer flow (`v2`) or original direct-search flow (`v1`). |
 | `--headless` | Off | Runs Chrome without a visible window. Visible mode is generally more reliable for TikTok. |
 | `--keep-browser-open` | Off | Keeps the Puppeteer Chrome process open after completion. |
 | `--download-video` | Off | Downloads each available video into `downloads/`. |
@@ -62,6 +67,12 @@ Scrape five videos with comments:
 
 ```bash
 npm run scrape -- --search "curanmor" --max 5 --comments 50
+```
+
+Use the original direct-search flow:
+
+```bash
+npm run scrape -- --flow v1 --search "curanmor" --max 5 --comments 50
 ```
 
 Scrape five unique videos and download them:
@@ -111,6 +122,7 @@ npm run scrape -- \
 - `downloads/*.mp4`: downloaded videos when `--download-video` is enabled.
 - `data/scraped-video-ids.json`: local deduplication registry when `--skip-existing` is enabled.
 - `.chrome-profile/`: persistent TikTok browser session.
+- `debug/<timestamp>-<stage>/`: screenshot, HTML, and context captured when navigation fails.
 
 These runtime directories are ignored by Git.
 

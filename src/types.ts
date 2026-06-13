@@ -8,9 +8,7 @@ export type ScrapedComment = {
 export type ScrapedVideo = {
   videoId: string | null;
   url: string;
-  title: string | null;
   caption: string | null;
-  description: string | null;
   username: string | null;
   authorUrl: string | null;
   videoSrc: string | null;
@@ -18,7 +16,6 @@ export type ScrapedVideo = {
   videoFile: string | null;
   downloadError?: string;
   stats: VideoStats;
-  keywordMentioned: boolean;
   comments: ScrapedComment[];
 };
 
@@ -36,6 +33,7 @@ export type VideoStats = {
 };
 
 export type ScrapeSettings = {
+  flow: ScrapeFlow;
   maxVideos: number;
   commentsPerVideo: number;
   headless: boolean;
@@ -65,6 +63,7 @@ export type ScrapeResult = {
 };
 
 export type ScrapeOptions = {
+  flow: ScrapeFlow;
   search: string;
   keyword: string | null;
   maxVideos: number;
@@ -79,3 +78,5 @@ export type ScrapeOptions = {
 export type CliOptions = ScrapeOptions & {
   output: string | null;
 };
+
+export type ScrapeFlow = 'v1' | 'v2';
